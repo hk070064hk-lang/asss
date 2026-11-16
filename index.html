@@ -29,7 +29,7 @@
            font-size:12px; font-family:ui-monospace, monospace; margin-bottom:14px; }
   .stats b { color:#8ab4f8; font-weight:normal; }
   #log { font-family:ui-monospace, monospace; font-size:12px; background:#0a0a0a;
-         border:1px solid #222; border-radius:6px; padding:10px; height:150px;
+         border:1px solid #222; border-radius:6px; padding:10px; height:170px;
          overflow:auto; white-space:pre-wrap; }
 </style>
 </head>
@@ -50,8 +50,8 @@
         <option value="中">中</option>
         <option value="強">強</option>
       </select>
-      <button id="startBtn" class="primary">開始</button>
-      <button id="stopBtn" class="danger" disabled>停止</button>
+      <button id="startBtn" class="primary" type="button">開始</button>
+      <button id="stopBtn" class="danger" type="button" disabled>停止</button>
     </div>
   </fieldset>
 
@@ -68,7 +68,7 @@
     <div>保持バッファ: <b id="stBuf">0 MB</b></div>
     <div>処理済み資産: <b id="stAssets">0</b></div>
     <div>ローカル I/O: <b id="stIo">0 MB</b></div>
-    <div>経過: <b id="stTime">0.0 s</b></div>
+    <div>経過: <b id="stTime">-</b></div>
   </div>
 
   <div id="log"></div>
@@ -77,23 +77,21 @@
 <script>
 /* ============================================================
  *  CONFIG — ここの数字を変えると強度が変わります
- *  （画面上の入力欄からも変更できます）
  * ============================================================ */
 const CONFIG = {
-  workers:            4,     // 同時に動かす Web Worker 数        (1–4)
-  assetsPerRound:     50,     // 1 ラウンドで処理する 3D 資産数     (1–50)
-  trianglesPerAsset:  100000,  // 1 資産あたりの三角面数             (100–100000)
-  allocMBPerRound:    32,     // 1 ラウンドで保持するバッファ (MB)  (1–32)
-  maxRetainedMB:      1024,   // 保持バッファの総量上限 (MB)        (32–1024)
-  rounds:             200,    // 総ラウンド数                       (1–200)
-  roundIntervalMs:    5000,   // ラウンド間隔 (ms)                  (100–5000)
-  ioMB:               64,     // 1 回のローカル I/O データ量 (MB)   (1–64)
-  ioLoops:            10,     // 1 ラウンドあたりのローカル I/O 回数 (0–10)
-  autoStopFps:        0,    // 平均 FPS がこれを下回ったら自動停止 (0=無効)
-  autoStopHeapMB:     0,     // ヒープがこれを超えたら自動停止 (0=無効)
+  workers:            1,
+  assetsPerRound:     5,
+  trianglesPerAsset:  5000,
+  allocMBPerRound:    4,
+  maxRetainedMB:      256,
+  rounds:             10,
+  roundIntervalMs:    400,
+  ioMB:               8,
+  ioLoops:            3,
+  autoStopFps:        10,
+  autoStopHeapMB:     0,
 };
 
-/* 強度プリセット（CONFIG の一部をまとめて書き換える） */
 const PRESETS = {
   '極弱': { workers:1, assetsPerRound:2,  trianglesPerAsset:3000,  allocMBPerRound:2,  rounds:5,  roundIntervalMs:600, ioMB:4,  ioLoops:1 },
   '弱':   { workers:1, assetsPerRound:5,  trianglesPerAsset:5000,  allocMBPerRound:4,  rounds:10, roundIntervalMs:400, ioMB:8,  ioLoops:3 },
@@ -101,7 +99,6 @@ const PRESETS = {
   '強':   { workers:4, assetsPerRound:20, trianglesPerAsset:60000, allocMBPerRound:16, rounds:40, roundIntervalMs:200, ioMB:32, ioLoops:6 },
 };
 
-/* 各パラメータの許容範囲（クランプ） */
 const LIMITS = {
   workers:           [1, 4],
   assetsPerRound:    [1, 50],
@@ -130,11 +127,6 @@ const FIELDS = [
   ['autoStopHeapMB',    '自動停止 ヒープ上限 (0=無効)'],
 ];
 
-/* ============================================================
- *  Worker（3D 資産の頂点/インデックスバッファ生成を模擬）
- *  ※ WebGL コンテキストは作りません。大量に作ると GPU プロセスごと
- *    落ちて停止ボタンも押せなくなるため、純粋な CPU/メモリ負荷で代替。
- * ============================================================ */
 const WORKER_SRC = `
 self.onmessage = function (e) {
   const { triangles, assets } = e.data;
@@ -153,9 +145,6 @@ self.onmessage = function (e) {
 };
 `;
 
-/* ============================================================
- *  状態
- * ============================================================ */
 const state = {
   running: false,
   round: 0,
@@ -182,7 +171,7 @@ function log(msg) {
 function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
 
 function heapMB() {
-  return performance.memory
+  return (performance && performance.memory)
     ? performance.memory.usedJSHeapSize / 1048576
     : NaN;
 }
@@ -191,9 +180,6 @@ function retainedMB() {
   return state.buffers.reduce((s, b) => s + b.byteLength, 0) / 1048576;
 }
 
-/* ============================================================
- *  UI 構築
- * ============================================================ */
 function buildFields() {
   const box = $('fields');
   box.innerHTML = '';
@@ -236,9 +222,7 @@ function updateStats() {
     : '-';
 }
 
-/* ============================================================
- *  FPS 監視 & 自動停止（安全弁）
- * ============================================================ */
+/* ---- FPS 監視（自動停止の安全弁） ---- */
 let rafFrames = 0;
 let rafLast = performance.now();
 
@@ -257,51 +241,35 @@ function rafLoop(t) {
 
 function checkAutoStop() {
   if (!state.running) return;
-
   if (CONFIG.autoStopFps > 0) {
     if (state.fps < CONFIG.autoStopFps) state.lowFpsStreak++;
     else state.lowFpsStreak = 0;
     if (state.lowFpsStreak >= 4) {
-      stop(`自動停止：FPS が ${CONFIG.autoStopFps} を下回りました（${state.fps.toFixed(1)}）`);
+      stopTest(`自動停止：FPS が ${CONFIG.autoStopFps} を下回りました（${state.fps.toFixed(1)}）`);
       return;
     }
   }
-
   const h = heapMB();
   if (CONFIG.autoStopHeapMB > 0 && !Number.isNaN(h) && h > CONFIG.autoStopHeapMB) {
-    stop(`自動停止：JS ヒープが ${CONFIG.autoStopHeapMB} MB を超えました`);
+    stopTest(`自動停止：JS ヒープが ${CONFIG.autoStopHeapMB} MB を超えました`);
   }
 }
 
-/* ============================================================
- *  ローカル I/O（ダウンロード/アップロードのシミュレート）
- *  ネットワークには一切出ません。
- * ============================================================ */
+/* ---- ローカル I/O（ダウンロード/アップロード相当） ---- */
 async function localIO() {
-  const mb = CONFIG.ioMB;
-  const bytes = new Uint8Array(mb * 1048576);
-  // 遅延アロケートを避けるため先頭をタッチ
+  const bytes = new Uint8Array(CONFIG.ioMB * 1048576);
   for (let i = 0; i < bytes.length; i += 4096) bytes[i] = i & 0xff;
-
   const blob = new Blob([bytes]);
-
-  // 受信側（ダウンロード相当）
   const down = await blob.arrayBuffer();
-  // 送信側（アップロード相当）— 同じくローカルで読み戻すだけ
   const up = await new Response(blob).arrayBuffer();
-
   return (down.byteLength + up.byteLength) / 1048576;
 }
 
-/* ============================================================
- *  メモリ確保（3D 資産の常駐バッファを模擬）
- * ============================================================ */
+/* ---- 常駐バッファ確保 ---- */
 function allocChunk() {
-  const size = CONFIG.allocMBPerRound * 1048576;
-  const buf = new ArrayBuffer(size);
-  new Uint8Array(buf).fill(1);     // 実ページをコミットさせる
+  const buf = new ArrayBuffer(CONFIG.allocMBPerRound * 1048576);
+  new Uint8Array(buf).fill(1);
   state.buffers.push(buf);
-
   const maxBytes = CONFIG.maxRetainedMB * 1048576;
   let total = state.buffers.reduce((s, b) => s + b.byteLength, 0);
   while (total > maxBytes && state.buffers.length > 1) {
@@ -309,62 +277,81 @@ function allocChunk() {
   }
 }
 
-/* ============================================================
- *  実行制御
- * ============================================================ */
+/* ---- Worker 生成（失敗したら null を返す） ---- */
 function makeWorker() {
-  const blob = new Blob([WORKER_SRC], { type: 'text/javascript' });
-  const url = URL.createObjectURL(blob);
-  const w = new Worker(url);
-  w.onmessage = (e) => {
-    state.assetsDone += e.data.assets;
-    updateStats();
-  };
-  state.workerUrls.push(url);
-  return w;
+  try {
+    const blob = new Blob([WORKER_SRC], { type: 'text/javascript' });
+    const url = URL.createObjectURL(blob);
+    const w = new Worker(url);
+    w.onmessage = (e) => {
+      state.assetsDone += e.data.assets;
+      updateStats();
+    };
+    w.onerror = (e) => {
+      log(`Worker エラー: ${e.message || 'unknown'}`);
+    };
+    state.workerUrls.push(url);
+    return w;
+  } catch (err) {
+    log(`Worker 作成失敗: ${err.message}。3D 計算はスキップします（メモリと I/O のみ）。`);
+    return null;
+  }
 }
 
-function start() {
+/* ---- 開始 / 停止 ---- */
+function startTest() {
   if (state.running) return;
+  try {
+    state.running = true;
+    state.round = 0;
+    state.assetsDone = 0;
+    state.ioDone = 0;
+    state.lowFpsStreak = 0;
+    state.fps = 60;
+    state.buffers = [];
+    state.startTime = performance.now();
+    $('log').textContent = '';
 
-  state.running = true;
-  state.round = 0;
-  state.assetsDone = 0;
-  state.ioDone = 0;
-  state.lowFpsStreak = 0;
-  state.fps = 60;
-  state.buffers = [];
-  state.startTime = performance.now();
-  $('log').textContent = '';
+    if (location.protocol === 'file:') {
+      log('注意: file:// で開いています。ブラウザによっては Worker が使えないため、' +
+          'その場合は 3D 計算をスキップして動作します。');
+    }
 
-  log(`開始: workers=${CONFIG.workers} assets/round=${CONFIG.assetsPerRound} ` +
-      `tri/asset=${CONFIG.trianglesPerAsset} alloc=${CONFIG.allocMBPerRound}MB ` +
-      `rounds=${CONFIG.rounds}`);
+    log(`開始: workers=${CONFIG.workers} assets/round=${CONFIG.assetsPerRound} ` +
+        `tri/asset=${CONFIG.trianglesPerAsset} alloc=${CONFIG.allocMBPerRound}MB ` +
+        `rounds=${CONFIG.rounds}`);
 
-  for (let i = 0; i < CONFIG.workers; i++) state.workers.push(makeWorker());
+    for (let i = 0; i < CONFIG.workers; i++) {
+      const w = makeWorker();
+      if (w) state.workers.push(w);
+    }
 
-  $('startBtn').disabled = true;
-  $('stopBtn').disabled = false;
-  $('preset').disabled = true;
-  document.querySelectorAll('#fields input').forEach((i) => (i.disabled = true));
+    $('startBtn').disabled = true;
+    $('stopBtn').disabled = false;
+    $('preset').disabled = true;
+    document.querySelectorAll('#fields input').forEach((i) => (i.disabled = true));
 
-  rafFrames = 0;
-  rafLast = performance.now();
-  requestAnimationFrame(rafLoop);
+    rafFrames = 0;
+    rafLast = performance.now();
+    requestAnimationFrame(rafLoop);
 
-  tick();
+    tick();
+  } catch (err) {
+    log(`開始時エラー: ${err.message}`);
+    stopTest('開始時エラー');
+  }
 }
 
-function stop(reason) {
+function stopTest(reason) {
   if (!state.running) return;
   state.running = false;
 
   if (state.roundTimer) { clearTimeout(state.roundTimer); state.roundTimer = null; }
-  state.workers.forEach((w) => w.terminate());
+  state.workers.forEach((w) => { try { w.terminate(); } catch (_) {} });
   state.workers = [];
-  state.workerUrls.forEach((u) => URL.revokeObjectURL(u));
+  state.workerUrls.forEach((u) => { try { URL.revokeObjectURL(u); } catch (_) {} });
   state.workerUrls = [];
-  state.buffers = [];              // 参照を切って GC に返す
+  state.buffers = [];
 
   $('startBtn').disabled = false;
   $('stopBtn').disabled = true;
@@ -377,29 +364,22 @@ function stop(reason) {
 
 async function tick() {
   if (!state.running) return;
+  if (state.round >= CONFIG.rounds) { stopTest('全ラウンド完了'); return; }
 
-  if (state.round >= CONFIG.rounds) {
-    stop('全ラウンド完了');
-    return;
-  }
   state.round++;
   log(`--- ラウンド ${state.round} / ${CONFIG.rounds} ---`);
 
-  // 1) 常駐バッファ確保
   allocChunk();
 
-  // 2) 3D 資産処理を Worker に分散
-  const per = Math.max(1, Math.ceil(CONFIG.assetsPerRound / CONFIG.workers));
+  const per = Math.max(1, Math.ceil(CONFIG.assetsPerRound / Math.max(1, state.workers.length)));
   state.workers.forEach((w) => {
     w.postMessage({ triangles: CONFIG.trianglesPerAsset, assets: per });
   });
 
-  // 3) ローカル I/O
   if (CONFIG.ioLoops > 0) {
     try {
       for (let i = 0; i < CONFIG.ioLoops && state.running; i++) {
-        const mb = await localIO();
-        state.ioDone += mb;
+        state.ioDone += await localIO();
       }
     } catch (err) {
       log(`ローカル I/O エラー: ${err.message}`);
@@ -411,9 +391,7 @@ async function tick() {
   state.roundTimer = setTimeout(tick, CONFIG.roundIntervalMs);
 }
 
-/* ============================================================
- *  イベント登録
- * ============================================================ */
+/* ---- イベント ---- */
 $('preset').addEventListener('change', (e) => {
   const p = PRESETS[e.target.value];
   if (!p) return;
@@ -421,16 +399,19 @@ $('preset').addEventListener('change', (e) => {
   syncFields();
 });
 
-$('startBtn').addEventListener('click', start);
-$('stopBtn').addEventListener('click', () => stop('手動'));
+$('startBtn').addEventListener('click', startTest);
+$('stopBtn').addEventListener('click', () => stopTest('手動'));
 
-// タブを閉じる/離れるときは必ず止める
-window.addEventListener('pagehide', () => stop('ページ離脱'));
-window.addEventListener('beforeunload', () => stop('ページ離脱'));
+// タブ離脱時は確実に停止（stopTest に改名したので window.stop と衝突しない）
+window.addEventListener('pagehide', () => stopTest('ページ離脱'));
+window.addEventListener('beforeunload', () => stopTest('ページ離脱'));
 
+/* ---- 初期化 ---- */
 buildFields();
 updateStats();
-log('準備完了。パラメータを確認して「開始」を押してください。');
+$('startBtn').disabled = false;
+$('stopBtn').disabled = true;
+log('準備完了。「開始」を押してください。');
 </script>
 </body>
 </html>
