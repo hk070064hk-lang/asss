@@ -89,8 +89,8 @@ const CONFIG = {
   roundIntervalMs:    5000,   // ラウンド間隔 (ms)                  (100–5000)
   ioMB:               64,     // 1 回のローカル I/O データ量 (MB)   (1–64)
   ioLoops:            10,     // 1 ラウンドあたりのローカル I/O 回数 (0–10)
-  autoStopFps:        #,    // 平均 FPS がこれを下回ったら自動停止 (0=無効)
-  autoStopHeapMB:     #,     // ヒープがこれを超えたら自動停止 (0=無効)
+  autoStopFps:        0,    // 平均 FPS がこれを下回ったら自動停止 (0=無効)
+  autoStopHeapMB:     0,     // ヒープがこれを超えたら自動停止 (0=無効)
 };
 
 /* 強度プリセット（CONFIG の一部をまとめて書き換える） */
