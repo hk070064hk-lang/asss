@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chromebook 負荷テスト（安全版）</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, "Hiragino Sans", "Noto Sans JP", sans-serif;
+         background:#111; color:#ddd; margin:0; padding:24px; line-height:1.6; }
+  .panel { max-width: 780px; margin: 0 auto; }
+  h1 { font-size: 17px; margin: 0 0 6px; }
+  .warn { color:#e8a33d; font-size:12px; margin:0 0 18px; }
+  fieldset { border:1px solid #2e2e2e; border-radius:8px; padding:10px 16px 14px; margin:0 0 14px; }
+  legend { color:#8ab4f8; font-size:12px; padding:0 6px; }
+  label { display:flex; justify-content:space-between; align-items:center;
+          gap:12px; font-size:13px; padding:3px 0; }
+  label span.hint { color:#777; font-size:11px; font-weight:normal; }
+  input[type=number], select { width:130px; background:#1c1c1c; color:#eee;
+          border:1px solid #444; border-radius:4px; padding:4px 6px; font-size:13px; }
+  .row { display:flex; gap:10px; align-items:center; margin-bottom:14px; flex-wrap:wrap; }
+  button { font-size:14px; padding:8px 18px; border-radius:6px; border:1px solid #444;
+           background:#2a2a2a; color:#eee; cursor:pointer; }
+  button.primary { background:#1a5cff; border-color:#1a5cff; }
+  button.danger  { background:#8b1d1d; border-color:#8b1d1d; }
+  button:disabled { opacity:.4; cursor:default; }
+  .stats { display:grid; grid-template-columns:repeat(2,1fr); gap:4px 18px;
+           font-size:12px; font-family:ui-monospace, monospace; margin-bottom:14px; }
+  .stats b { color:#8ab4f8; font-weight:normal; }
+  #log { font-family:ui-monospace, monospace; font-size:12px; background:#0a0a0a;
+         border:1px solid #222; border-radius:6px; padding:10px; height:150px;
+         overflow:auto; white-space:pre-wrap; }
+</style>
+</head>
+<body>
+<div class="panel">
+  <h1>Chromebook 負荷テスト（安全版・ローカル完結）</h1>
+  <p class="warn">
+    自分が管理する端末でのみ実行してください。外部サーバーへの通信は一切行いません
+    （ダウンロード/アップロードはローカル Blob の読み書きでシミュレートしています）。
+  </p>
+
+  <fieldset>
+    <legend>プリセット</legend>
+    <div class="row">
+      <select id="preset">
+        <option value="極弱">極弱</option>
+        <option value="弱" selected>弱</option>
+        <option value="中">中</option>
+        <option value="強">強</option>
+      </select>
+      <button id="startBtn" class="primary">開始</button>
+      <button id="stopBtn" class="danger" disabled>停止</button>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>パラメータ（コード冒頭の CONFIG と同じ値）</legend>
+    <div id="fields"></div>
+  </fieldset>
+
+  <div class="stats">
+    <div>状態: <b id="stState">idle</b></div>
+    <div>ラウンド: <b id="stRound">0 / 0</b></div>
+    <div>FPS: <b id="stFps">-</b></div>
+    <div>JS ヒープ: <b id="stHeap">-</b></div>
+    <div>保持バッファ: <b id="stBuf">0 MB</b></div>
+    <div>処理済み資産: <b id="stAssets">0</b></div>
+    <div>ローカル I/O: <b id="stIo">0 MB</b></div>
+    <div>経過: <b id="stTime">0.0 s</b></div>
+  </div>
+
+  <div id="log"></div>
+</div>
+
+<script>
+/* ============================================================
+ *  CONFIG — ここの数字を変えると強度が変わります
+ *  （画面上の入力欄からも変更できます）
+ * ============================================================ */
+const CONFIG = {
+  workers:            4,     // 同時に動かす Web Worker 数        (1–4)
+  assetsPerRound:     50,     // 1 ラウンドで処理する 3D 資産数     (1–50)
+  trianglesPerAsset:  100000,  // 1 資産あたりの三角面数             (100–100000)
+  allocMBPerRound:    32,     // 1 ラウンドで保持するバッファ (MB)  (1–32)
+  maxRetainedMB:      1024,   // 保持バッファの総量上限 (MB)        (32–1024)
+  rounds:             200,    // 総ラウンド数                       (1–200)
+  roundIntervalMs:    5000,   // ラウンド間隔 (ms)                  (100–5000)
+  ioMB:               64,     // 1 回のローカル I/O データ量 (MB)   (1–64)
+  ioLoops:            10,     // 1 ラウンドあたりのローカル I/O 回数 (0–10)
+  autoStopFps:        #,    // 平均 FPS がこれを下回ったら自動停止 (0=無効)
+  autoStopHeapMB:     #,     // ヒープがこれを超えたら自動停止 (0=無効)
+};
+
+/* 強度プリセット（CONFIG の一部をまとめて書き換える） */
+const PRESETS = {
+  '極弱': { workers:1, assetsPerRound:2,  trianglesPerAsset:3000,  allocMBPerRound:2,  rounds:5,  roundIntervalMs:600, ioMB:4,  ioLoops:1 },
+  '弱':   { workers:1, assetsPerRound:5,  trianglesPerAsset:5000,  allocMBPerRound:4,  rounds:10, roundIntervalMs:400, ioMB:8,  ioLoops:3 },
+  '中':   { workers:2, assetsPerRound:10, trianglesPerAsset:20000, allocMBPerRound:8,  rounds:20, roundIntervalMs:300, ioMB:16, ioLoops:4 },
+  '強':   { workers:4, assetsPerRound:20, trianglesPerAsset:60000, allocMBPerRound:16, rounds:40, roundIntervalMs:200, ioMB:32, ioLoops:6 },
+};
+
+/* 各パラメータの許容範囲（クランプ） */
+const LIMITS = {
+  workers:           [1, 4],
+  assetsPerRound:    [1, 50],
+  trianglesPerAsset: [100, 100000],
+  allocMBPerRound:   [1, 32],
+  maxRetainedMB:     [32, 1024],
+  rounds:            [1, 200],
+  roundIntervalMs:   [100, 5000],
+  ioMB:              [1, 64],
+  ioLoops:           [0, 10],
+  autoStopFps:       [0, 60],
+  autoStopHeapMB:    [0, 4096],
+};
+
+const FIELDS = [
+  ['workers',           'Worker 数'],
+  ['assetsPerRound',    '1 ラウンドの 3D 資産数'],
+  ['trianglesPerAsset', '1 資産の三角面数'],
+  ['allocMBPerRound',   '1 ラウンドの確保メモリ (MB)'],
+  ['maxRetainedMB',     '保持メモリ上限 (MB)'],
+  ['rounds',            '総ラウンド数'],
+  ['roundIntervalMs',   'ラウンド間隔 (ms)'],
+  ['ioMB',              'ローカル I/O サイズ (MB)'],
+  ['ioLoops',           'ローカル I/O 回数 / ラウンド'],
+  ['autoStopFps',       '自動停止 FPS しきい値 (0=無効)'],
+  ['autoStopHeapMB',    '自動停止 ヒープ上限 (0=無効)'],
+];
+
+/* ============================================================
+ *  Worker（3D 資産の頂点/インデックスバッファ生成を模擬）
+ *  ※ WebGL コンテキストは作りません。大量に作ると GPU プロセスごと
+ *    落ちて停止ボタンも押せなくなるため、純粋な CPU/メモリ負荷で代替。
+ * ============================================================ */
+const WORKER_SRC = `
+self.onmessage = function (e) {
+  const { triangles, assets } = e.data;
+  let checksum = 0;
+  for (let a = 0; a < assets; a++) {
+    const verts = new Float32Array(triangles * 3);
+    for (let i = 0; i < verts.length; i++) {
+      verts[i] = Math.sin(i * 0.001) * Math.cos(i * 0.0007);
+      checksum += verts[i];
+    }
+    const idx = new Uint32Array(triangles * 3);
+    for (let i = 0; i < idx.length; i++) idx[i] = i % 65535;
+    checksum += idx[0] || 0;
+  }
+  self.postMessage({ checksum: checksum, assets: assets });
+};
+`;
+
+/* ============================================================
+ *  状態
+ * ============================================================ */
+const state = {
+  running: false,
+  round: 0,
+  workers: [],
+  workerUrls: [],
+  buffers: [],
+  assetsDone: 0,
+  ioDone: 0,
+  roundTimer: null,
+  startTime: 0,
+  lowFpsStreak: 0,
+  fps: 60,
+};
+
+const $ = (id) => document.getElementById(id);
+
+function log(msg) {
+  const el = $('log');
+  const t = ((performance.now() - (state.startTime || performance.now())) / 1000).toFixed(1);
+  el.textContent += `[${t}s] ${msg}\n`;
+  el.scrollTop = el.scrollHeight;
+}
+
+function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
+
+function heapMB() {
+  return performance.memory
+    ? performance.memory.usedJSHeapSize / 1048576
+    : NaN;
+}
+
+function retainedMB() {
+  return state.buffers.reduce((s, b) => s + b.byteLength, 0) / 1048576;
+}
+
+/* ============================================================
+ *  UI 構築
+ * ============================================================ */
+function buildFields() {
+  const box = $('fields');
+  box.innerHTML = '';
+  for (const [key, label] of FIELDS) {
+    const el = document.createElement('label');
+    const [lo, hi] = LIMITS[key];
+    el.innerHTML = `<span>${label} <span class="hint">(${lo}–${hi})</span></span>`;
+    const input = document.createElement('input');
+    input.type = 'number';
+    input.min = lo; input.max = hi; input.step = 1;
+    input.value = CONFIG[key];
+    input.dataset.key = key;
+    input.addEventListener('input', () => {
+      const v = Number(input.value);
+      if (!Number.isFinite(v)) return;
+      CONFIG[key] = clamp(Math.round(v), lo, hi);
+    });
+    el.appendChild(input);
+    box.appendChild(el);
+  }
+}
+
+function syncFields() {
+  document.querySelectorAll('#fields input').forEach((input) => {
+    input.value = CONFIG[input.dataset.key];
+  });
+}
+
+function updateStats() {
+  $('stState').textContent = state.running ? 'running' : 'idle';
+  $('stRound').textContent = `${state.round} / ${CONFIG.rounds}`;
+  $('stFps').textContent = state.running ? state.fps.toFixed(0) : '-';
+  const h = heapMB();
+  $('stHeap').textContent = Number.isNaN(h) ? 'N/A' : `${h.toFixed(1)} MB`;
+  $('stBuf').textContent = `${retainedMB().toFixed(1)} MB`;
+  $('stAssets').textContent = String(state.assetsDone);
+  $('stIo').textContent = `${state.ioDone.toFixed(1)} MB`;
+  $('stTime').textContent = state.running
+    ? `${((performance.now() - state.startTime) / 1000).toFixed(1)} s`
+    : '-';
+}
+
+/* ============================================================
+ *  FPS 監視 & 自動停止（安全弁）
+ * ============================================================ */
+let rafFrames = 0;
+let rafLast = performance.now();
+
+function rafLoop(t) {
+  if (!state.running) return;
+  rafFrames++;
+  if (t - rafLast >= 500) {
+    state.fps = (rafFrames * 1000) / (t - rafLast);
+    rafFrames = 0;
+    rafLast = t;
+    checkAutoStop();
+    updateStats();
+  }
+  requestAnimationFrame(rafLoop);
+}
+
+function checkAutoStop() {
+  if (!state.running) return;
+
+  if (CONFIG.autoStopFps > 0) {
+    if (state.fps < CONFIG.autoStopFps) state.lowFpsStreak++;
+    else state.lowFpsStreak = 0;
+    if (state.lowFpsStreak >= 4) {
+      stop(`自動停止：FPS が ${CONFIG.autoStopFps} を下回りました（${state.fps.toFixed(1)}）`);
+      return;
+    }
+  }
+
+  const h = heapMB();
+  if (CONFIG.autoStopHeapMB > 0 && !Number.isNaN(h) && h > CONFIG.autoStopHeapMB) {
+    stop(`自動停止：JS ヒープが ${CONFIG.autoStopHeapMB} MB を超えました`);
+  }
+}
+
+/* ============================================================
+ *  ローカル I/O（ダウンロード/アップロードのシミュレート）
+ *  ネットワークには一切出ません。
+ * ============================================================ */
+async function localIO() {
+  const mb = CONFIG.ioMB;
+  const bytes = new Uint8Array(mb * 1048576);
+  // 遅延アロケートを避けるため先頭をタッチ
+  for (let i = 0; i < bytes.length; i += 4096) bytes[i] = i & 0xff;
+
+  const blob = new Blob([bytes]);
+
+  // 受信側（ダウンロード相当）
+  const down = await blob.arrayBuffer();
+  // 送信側（アップロード相当）— 同じくローカルで読み戻すだけ
+  const up = await new Response(blob).arrayBuffer();
+
+  return (down.byteLength + up.byteLength) / 1048576;
+}
+
+/* ============================================================
+ *  メモリ確保（3D 資産の常駐バッファを模擬）
+ * ============================================================ */
+function allocChunk() {
+  const size = CONFIG.allocMBPerRound * 1048576;
+  const buf = new ArrayBuffer(size);
+  new Uint8Array(buf).fill(1);     // 実ページをコミットさせる
+  state.buffers.push(buf);
+
+  const maxBytes = CONFIG.maxRetainedMB * 1048576;
+  let total = state.buffers.reduce((s, b) => s + b.byteLength, 0);
+  while (total > maxBytes && state.buffers.length > 1) {
+    total -= state.buffers.shift().byteLength;
+  }
+}
+
+/* ============================================================
+ *  実行制御
+ * ============================================================ */
+function makeWorker() {
+  const blob = new Blob([WORKER_SRC], { type: 'text/javascript' });
+  const url = URL.createObjectURL(blob);
+  const w = new Worker(url);
+  w.onmessage = (e) => {
+    state.assetsDone += e.data.assets;
+    updateStats();
+  };
+  state.workerUrls.push(url);
+  return w;
+}
+
+function start() {
+  if (state.running) return;
+
+  state.running = true;
+  state.round = 0;
+  state.assetsDone = 0;
+  state.ioDone = 0;
+  state.lowFpsStreak = 0;
+  state.fps = 60;
+  state.buffers = [];
+  state.startTime = performance.now();
+  $('log').textContent = '';
+
+  log(`開始: workers=${CONFIG.workers} assets/round=${CONFIG.assetsPerRound} ` +
+      `tri/asset=${CONFIG.trianglesPerAsset} alloc=${CONFIG.allocMBPerRound}MB ` +
+      `rounds=${CONFIG.rounds}`);
+
+  for (let i = 0; i < CONFIG.workers; i++) state.workers.push(makeWorker());
+
+  $('startBtn').disabled = true;
+  $('stopBtn').disabled = false;
+  $('preset').disabled = true;
+  document.querySelectorAll('#fields input').forEach((i) => (i.disabled = true));
+
+  rafFrames = 0;
+  rafLast = performance.now();
+  requestAnimationFrame(rafLoop);
+
+  tick();
+}
+
+function stop(reason) {
+  if (!state.running) return;
+  state.running = false;
+
+  if (state.roundTimer) { clearTimeout(state.roundTimer); state.roundTimer = null; }
+  state.workers.forEach((w) => w.terminate());
+  state.workers = [];
+  state.workerUrls.forEach((u) => URL.revokeObjectURL(u));
+  state.workerUrls = [];
+  state.buffers = [];              // 参照を切って GC に返す
+
+  $('startBtn').disabled = false;
+  $('stopBtn').disabled = true;
+  $('preset').disabled = false;
+  document.querySelectorAll('#fields input').forEach((i) => (i.disabled = false));
+
+  log(`停止: ${reason || '手動'}`);
+  updateStats();
+}
+
+async function tick() {
+  if (!state.running) return;
+
+  if (state.round >= CONFIG.rounds) {
+    stop('全ラウンド完了');
+    return;
+  }
+  state.round++;
+  log(`--- ラウンド ${state.round} / ${CONFIG.rounds} ---`);
+
+  // 1) 常駐バッファ確保
+  allocChunk();
+
+  // 2) 3D 資産処理を Worker に分散
+  const per = Math.max(1, Math.ceil(CONFIG.assetsPerRound / CONFIG.workers));
+  state.workers.forEach((w) => {
+    w.postMessage({ triangles: CONFIG.trianglesPerAsset, assets: per });
+  });
+
+  // 3) ローカル I/O
+  if (CONFIG.ioLoops > 0) {
+    try {
+      for (let i = 0; i < CONFIG.ioLoops && state.running; i++) {
+        const mb = await localIO();
+        state.ioDone += mb;
+      }
+    } catch (err) {
+      log(`ローカル I/O エラー: ${err.message}`);
+    }
+  }
+
+  updateStats();
+  if (!state.running) return;
+  state.roundTimer = setTimeout(tick, CONFIG.roundIntervalMs);
+}
+
+/* ============================================================
+ *  イベント登録
+ * ============================================================ */
+$('preset').addEventListener('change', (e) => {
+  const p = PRESETS[e.target.value];
+  if (!p) return;
+  Object.assign(CONFIG, p);
+  syncFields();
+});
+
+$('startBtn').addEventListener('click', start);
+$('stopBtn').addEventListener('click', () => stop('手動'));
+
+// タブを閉じる/離れるときは必ず止める
+window.addEventListener('pagehide', () => stop('ページ離脱'));
+window.addEventListener('beforeunload', () => stop('ページ離脱'));
+
+buildFields();
+updateStats();
+log('準備完了。パラメータを確認して「開始」を押してください。');
+</script>
+</body>
+</html>
